@@ -12,7 +12,7 @@ Target: 6 to 10 years experience, integration architecture role.
 6. Modern Java (Java 8 to 21) (Q31 to Q35)
 7. Performance and Troubleshooting (Q36 to Q40)
 8. Frequently Asked Coding & Tricky Scenarios (Q41 to Q59)
-9. Java Streams (Concepts and Coding) (Q60 to Q77)
+9. Java Streams (Concepts and Coding) (Q60 to Q78)
 
 ---
 
@@ -1480,21 +1480,199 @@ Map<String, List<String>> groups = Stream.of("eat", "tea", "tan", "ate", "nat")
 
 ### Q77. What are the Stream API additions in Java 9 to 21?
 
-**Answer:**
-- **Java 9:** `takeWhile`, `dropWhile`, `Stream.ofNullable`, `Stream.iterate(seed, hasNext, next)`, `Optional.stream()`.
-- **Java 10:** `Collectors.toUnmodifiableList/Set/Map`.
-- **Java 12:** `Collectors.teeing(c1, c2, merger)` combines two collectors in one pass.
-- **Java 16:** `Stream.toList()`, `mapMulti()`.
-- **Java 22+ (preview):** Stream Gatherers (`gather(...)`) for custom intermediate operations such as windowing.
+**Answer:** After `Stream` was introduced in Java 8, later releases added methods to fix boilerplate, eliminate unnecessary stream allocations, support short-circuiting on ordered data, and bridge streams with new collection features.
+
+| Release | New Methods / Features | Problem It Solves |
+|---|---|---|
+| **Java 9** | `takeWhile`, `dropWhile`, `Stream.ofNullable`, `Stream.iterate(seed, hasNext, next)`, `Optional.stream()`, `Collectors.filtering`, `Collectors.flatMapping` | Conditional slicing, null-safe 0/1-element streams, bounded loops without `limit()`, and keeping empty groups in `groupingBy` |
+| **Java 10** | `Collectors.toUnmodifiableList()`, `toUnmodifiableSet()`, `toUnmodifiableMap()` | Collects directly into truly immutable collections (`null`-hostile) |
+| **Java 11** | `Predicate.not(...)`, `String.lines()` | Clean negation of method references (`filter(Predicate.not(String::isBlank))`) and lazy line streaming |
+| **Java 12** | `Collectors.teeing(c1, c2, merger)` | Runs two collectors in a **single pass** and merges their results (e.g., min + max, or count + average) |
+| **Java 16** | `Stream.toList()`, `Stream.mapMulti()` (`mapMultiToInt/Long/Double`) | Concise unmodifiable list terminal op; zero-allocation 1-to-many mapping alternative to `flatMap` |
+| **Java 21** | `SequencedCollection.reversed().stream()` | Stream any `List`, `Deque`, `LinkedHashSet` in reverse order without copying or indexing |
+| *(Java 22–24)* | `Stream.gather(Gatherer)` (`Gatherers.windowFixed`, `windowSliding`, `fold`, `scan`) | Custom intermediate operations (sliding/fixed windows, stateful folding) |
+
+---
+
+#### 1. Java 9 Additions
+
+- **`takeWhile(Predicate)` & `dropWhile(Predicate)`:**
+  - `filter()` checks **every** element in the stream.
+  - `takeWhile()` takes elements from the start **only while the predicate is true**, and **stops immediately (short-circuits)** on the first `false`.
+  - `dropWhile()` discards elements from the start while the predicate is true, and once it hits the first `false`, emits **all remaining elements** without testing them again.
+- **`Stream.ofNullable(T)`:** returns a 1-element stream if non-null, or `Stream.empty()` if `null`. Eliminates `val == null ? Stream.empty() : Stream.of(val)` inside `flatMap`.
+- **3-arg `Stream.iterate(seed, hasNextPredicate, unaryOperator)`:** works just like a classic `for (int i = 1; i <= 100; i *= 2)` loop without needing `.limit()`.
+- **`Optional.stream()`:** turns an `Optional<T>` into a 0-or-1 element `Stream<T>`, making `streamOfOptionals.flatMap(Optional::stream)` clean.
+- **`Collectors.filtering` & `Collectors.flatMapping`:** used as downstream collectors inside `groupingBy`. Unlike `.filter(...).collect(groupingBy(...))` (which completely drops departments where no employee matched the filter), `groupingBy(dept, filtering(...))` preserves every department key with an empty `[]` list.
 
 ```java
-List<Integer> asc = List.of(1, 2, 3, 7, 1, 2);
-asc.stream().takeWhile(n -> n < 5).toList();      // [1, 2, 3]
-asc.stream().dropWhile(n -> n < 5).toList();      // [7, 1, 2]
+// 1. takeWhile vs dropWhile (Notice how trailing '1, 2' are handled!)
+List<Integer> nums = List.of(1, 2, 3, 7, 1, 2);
+List<Integer> taken   = nums.stream().takeWhile(n -> n < 5).toList(); // [1, 2, 3] (stops at 7)
+List<Integer> dropped = nums.stream().dropWhile(n -> n < 5).toList(); // [7, 1, 2] (keeps everything from 7 onward)
 
-// teeing: min and max salary in a single pass
-String range = emps.stream().collect(Collectors.teeing(
+// 2. Stream.ofNullable — safely lookup keys in a Map without nulls
+Map<String, String> env = Map.of("DB_HOST", "localhost", "DB_PORT", "5432");
+List<String> values = Stream.of("DB_HOST", "MISSING_KEY", "DB_PORT")
+        .flatMap(key -> Stream.ofNullable(env.get(key)))
+        .toList();                                                    // [localhost, 5432]
+
+// 3. Bounded Stream.iterate (for-loop equivalent)
+List<Integer> powersOfTwo = Stream.iterate(1, n -> n <= 64, n -> n * 2)
+        .toList();                                                    // [1, 2, 4, 8, 16, 32, 64]
+
+// 4. Optional.stream() — unwrap present Optionals in one step
+List<Optional<String>> raw = List.of(Optional.of("A"), Optional.empty(), Optional.of("B"));
+List<String> present = raw.stream().flatMap(Optional::stream).toList(); // [A, B]
+
+// 5. Collectors.filtering inside groupingBy (preserves HR key with empty list!)
+Map<String, List<Employee>> highEarnersByDept = emps.stream()
+        .collect(Collectors.groupingBy(
+                Employee::dept,
+                Collectors.filtering(e -> e.salary() > 70000, Collectors.toList())));
+// {IT=[Asha, Ravi], HR=[], Finance=[Karan]}
+```
+
+---
+
+#### 2. Java 10 & Java 11 Additions
+
+- **Java 10 `Collectors.toUnmodifiableList()` / `toUnmodifiableSet()` / `toUnmodifiableMap()`:** produces truly immutable collections (`UnsupportedOperationException` on mutation) and rejects `null` elements with `NullPointerException`.
+- **Java 11 `Predicate.not(Predicate)` & `String.lines()`:** lets you negate method references cleanly (`Predicate.not(String::isBlank)` instead of `s -> !s.isBlank()`).
+
+```java
+String multiline = "order-101\n   \norder-102\n";
+List<String> orderIds = multiline.lines()                             // Java 11 lazy line stream
+        .filter(Predicate.not(String::isBlank))                       // Java 11 negated method reference
+        .collect(Collectors.toUnmodifiableList());                    // Java 10 immutable list -> [order-101, order-102]
+```
+
+---
+
+#### 3. Java 12 Addition: `Collectors.teeing()`
+
+When you need **two different aggregations** over the same stream (e.g., min and max, or filtered list and total count), previously you had to either stream the collection twice or write a custom collector. `Collectors.teeing(collector1, collector2, mergerBiFunction)` feeds each element into both downstream collectors in a **single pass** and combines the two results at the end.
+
+```java
+record SalaryReport(Employee lowest, Employee highest, double average) {}
+
+// Find lowest earner AND highest earner in a single stream pass
+String minMaxSummary = emps.stream().collect(Collectors.teeing(
         Collectors.minBy(Comparator.comparingDouble(Employee::salary)),
         Collectors.maxBy(Comparator.comparingDouble(Employee::salary)),
-        (min, max) -> min.get().name() + " .. " + max.get().name()));   // John .. Asha
+        (minOpt, maxOpt) -> minOpt.orElseThrow().name() + " to " + maxOpt.orElseThrow().name()
+));                                                                   // "John to Asha"
+
+// Compute both count and average salary in one pass
+Map<String, Number> stats = emps.stream().collect(Collectors.teeing(
+        Collectors.counting(),
+        Collectors.averagingDouble(Employee::salary),
+        (count, avg) -> Map.of("count", count, "avgSalary", avg)
+));                                                                   // {count=5, avgSalary=72000.0}
+```
+
+---
+
+#### 4. Java 16 Additions: `Stream.toList()` and `Stream.mapMulti()`
+
+- **`stream.toList()`:**
+  - Short terminal operation returning an **unmodifiable** `List`.
+  - Unlike `Collectors.toUnmodifiableList()`, `stream.toList()` **allows `null` elements** and is faster because it sizes the backing array directly when the stream size is known.
+- **`stream.mapMulti(BiConsumer<T, Consumer<R>>)`:**
+  - An imperative, high-performance alternative to `flatMap`.
+  - With `flatMap`, you must create a new `Stream` object for **every single input element**, which causes heavy allocation overhead when mapping 0 or 1–2 items.
+  - With `mapMulti`, you receive a `downstream.accept(...)` callback and push 0, 1, or many elements onto the pipeline **without allocating intermediate `Stream` objects** (and you can easily use `instanceof` pattern matching).
+
+```java
+// mapMulti: filter + cast + transform in one step with ZERO inner Stream allocations
+List<Object> mixed = List.of("Java", 42, "Spring Boot", -5, 100);
+
+List<String> validItems = mixed.stream()
+        .<String>mapMulti((element, downstream) -> {
+            if (element instanceof String s && !s.isBlank()) {
+                downstream.accept(s.toUpperCase());
+            } else if (element instanceof Integer n && n > 0) {
+                downstream.accept("NUM:" + n);
+            }
+            // negative numbers and other types simply call downstream.accept() 0 times!
+        })
+        .toList();                                                    // [JAVA, NUM:42, SPRING BOOT, NUM:100]
+```
+
+---
+
+#### 5. Java 21 Addition: `SequencedCollection` + `.reversed().stream()`
+
+Before Java 21, streaming a `List` in reverse order required `IntStream.range(...)` index math or copying and mutating a list with `Collections.reverse()`. Java 21 introduced `SequencedCollection` (`List`, `Deque`, `LinkedHashSet`), which provides a lightweight, zero-copy `.reversed()` view that you can stream directly.
+
+```java
+List<String> steps = List.of("Init", "Validate", "Charge", "Ship");
+
+List<String> rollbackOrder = steps.reversed()                         // zero-copy reverse view (Java 21)
+        .stream()
+        .map(step -> "Undo-" + step)
+        .toList();                                                    // [Undo-Ship, Undo-Charge, Undo-Validate, Undo-Init]
+```
+
+### Q78. What is `Predicate` in Java, and how do you compose and use it?
+
+**Answer:** `Predicate<T>` (in `java.util.function`) is a built-in `@FunctionalInterface` introduced in Java 8 that takes **one input of type `T`** and returns a **`boolean`**. It represents a condition or filter rule that you can store in a variable, pass as a method argument, combine dynamically, and reuse across Streams, `Optional`, and Collections.
+
+#### 1. Core Methods of `Predicate<T>`
+
+| Method | Type | Description |
+|---|---|---|
+| `boolean test(T t)` | Abstract (SAM) | Evaluates the condition on input `t` |
+| `and(Predicate<? super T> other)` | Default | Logical short-circuit `&&` (`p1.and(p2)`) |
+| `or(Predicate<? super T> other)` | Default | Logical short-circuit `\|\|` (`p1.or(p2)`) |
+| `negate()` | Default | Logical `!` (`p1.negate()`) |
+| `Predicate.not(Predicate<T>)` | Static (Java 11) | Negates a method reference cleanly (`Predicate.not(String::isBlank)`) |
+| `Predicate.isEqual(Object target)` | Static | Null-safe equality check (`Objects.equals(t, target)`) |
+
+#### 2. Specialized Variants (Avoid Boxing Overhead)
+- **Two arguments:** `BiPredicate<T, U>` -> `boolean test(T t, U u)`
+- **Primitives (no auto-boxing):** `IntPredicate`, `LongPredicate`, `DoublePredicate`
+
+#### 3. Where `Predicate` is Used in the JDK
+- `Stream.filter(Predicate)`, `anyMatch`, `allMatch`, `noneMatch`, `takeWhile`, `dropWhile`
+- `Collectors.partitioningBy(Predicate)` and `Collectors.filtering(Predicate, Collector)`
+- `Collection.removeIf(Predicate)` (removes matching elements in-place)
+- `Optional.filter(Predicate)`
+
+#### 4. Example: Composing Dynamic Business Rules with `Predicate`
+
+```java
+// 1. Define reusable atomic predicates
+Predicate<Employee> isItDept      = e -> "IT".equals(e.dept());
+Predicate<Employee> isHrDept      = e -> "HR".equals(e.dept());
+Predicate<Employee> isHighEarner  = e -> e.salary() >= 75000;
+Predicate<Employee> isSeniorAge   = e -> e.age() >= 35;
+
+// 2. Compose complex rules using and(), or(), negate()
+// Rule: (IT or HR) AND High Earner AND NOT Senior Age
+Predicate<Employee> targetRule = isItDept.or(isHrDept)
+        .and(isHighEarner)
+        .and(isSeniorAge.negate());
+
+List<String> matched = emps.stream()
+        .filter(targetRule)
+        .map(Employee::name)
+        .toList();                                                    // [Asha, Ravi]
+
+// 3. Dynamic filter chain (e.g., building search filters from optional request parameters)
+List<Predicate<Employee>> dynamicFilters = List.of(isItDept, isHighEarner);
+Predicate<Employee> combinedFilter = dynamicFilters.stream()
+        .reduce(x -> true, Predicate::and);                           // chains all with AND
+
+// 4. Using Predicate.not (Java 11), Predicate.isEqual, and Collection.removeIf
+List<String> tags = new ArrayList<>(Arrays.asList("java", "", "  ", "spring", "deprecated"));
+tags.removeIf(String::isBlank);                                       // removes "" and "  " in-place
+tags.removeIf(Predicate.isEqual("deprecated"));                       // removes "deprecated"
+
+// 5. BiPredicate (2 inputs) & IntPredicate (primitive, no Integer boxing)
+BiPredicate<Employee, Double> earnsMoreThan = (emp, threshold) -> emp.salary() > threshold;
+boolean ashaRich = earnsMoreThan.test(emps.get(0), 80000.0);          // true
+
+IntPredicate isEven = n -> n % 2 == 0;
+int[] evens = IntStream.rangeClosed(1, 10).filter(isEven).toArray();  // [2, 4, 6, 8, 10]
 ```
