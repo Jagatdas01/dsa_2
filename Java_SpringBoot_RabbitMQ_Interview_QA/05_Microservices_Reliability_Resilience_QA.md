@@ -12,7 +12,7 @@ Target: 6 to 10 years experience, integration architecture role.
 6. Observability and SLOs (Q34 to Q39)
 7. Deployment, Scaling and Disaster Recovery (Q40 to Q46)
 8. Governance and Architecture Decisions (Q47 to Q50)
-9. High-Frequency Architect & Production Incident Scenarios (Q51 to Q63)
+9. High-Frequency Architect & Production Incident Scenarios (Q51 to Q65)
 
 ---
 
@@ -546,3 +546,30 @@ void onOrderCreated(OrderCreatedEvent event) {
     paymentService.charge(event);                                     // idempotent handler
 }
 ```
+
+### Q64. API response time is 20ms normally, but spikes to 8 seconds under load with no errors in logs. Where do you start?
+
+**Answer:** "Slow under load with no errors" means **queuing / resource saturation / contention**, not exceptions. Start systematically from the outside in:
+1. **Check the Golden Signals & Traces (APM / OpenTelemetry / Micrometer):**
+   - Look at a slow trace: Is the 8s spent in **app CPU**, **GC pause**, **waiting for a DB query**, **waiting for a HikariCP connection**, or **calling a downstream HTTP API**?
+2. **Check Thread & Connection Pools (most common culprit):**
+   - **HikariCP (`hikaricp_connections_pending`):** Threads are waiting 7.9s just to borrow a DB connection because pool size is too small or slow queries are holding connections.
+   - **Tomcat / Web server threads:** All worker threads are busy, so requests sit in the accept/socket queue.
+   - **HTTP client pools** (RestTemplate/WebClient/Feign): Waiting on `maxConnectionsPerRoute`.
+3. **Take a Thread Dump (`jstack` / `/actuator/threaddump`) and check GC logs:**
+   - Look for many threads in `BLOCKED` (lock contention on `synchronized`), `WAITING` (waiting on pools/futures), or `RUNNABLE` stuck at the same stack frame.
+   - Check for long Stop-The-World GC pauses or CPU throttling in Kubernetes (`container_cpu_cfs_throttled_seconds_total`).
+4. **Check Downstream & DB:**
+   - Slow SQL queries (missing index, table/row lock contention, `SELECT ... FOR UPDATE`), or downstream API latency without aggressive timeouts.
+
+### Q65. A new feature was deployed Friday evening. By Monday morning everything is slow, even though nobody touched code over the weekend. What happened?
+
+**Answer:** Something **accumulated over time** (data, connections, memory, or state) until it crossed a saturation tipping point by Monday morning:
+1. **Data / Table Growth + Missing Index:** The new feature writes to a table (or queries it) without an index. Friday evening had 500 rows (fast); over the weekend it grew to 500,000+ rows, turning fast index lookups into full table scans and saturating DB CPU.
+2. **Memory / Connection Leak:** The new code leaks heap objects (e.g., `ThreadLocal`, unbounded in-memory cache) or DB/HTTP connections. By Monday, the JVM is in **GC thrashing** (spending 90%+ CPU in Full GC) or HikariCP is exhausted.
+3. **Queue / Backlog / Retry Buildup:** A new consumer or scheduled job failed silently or processed slower than the arrival rate, building a massive RabbitMQ/Kafka backlog or growing an outbox/retry table that now slows down every poll.
+4. **Stale DB Statistics / Query Plan Flip:** PostgreSQL/MySQL/Oracle optimizer switched from an index scan to a sequential scan once table row count crossed a threshold, or table bloat/dead tuples accumulated without autovacuum keeping up.
+5. **Monday Morning Traffic + Cold/Evicted Caches:** Weekend traffic was low; Monday morning traffic hit a cold cache or triggered a **Cache Stampede** on keys that expired over the weekend.
+
+**First steps to triage:** Check APM/metrics timeline from Friday -> Monday (heap/GC, DB CPU/slow queries, HikariCP pending connections, queue depth, pod restarts), then rollback or feature-flag off the Friday release if needed to restore service.
+

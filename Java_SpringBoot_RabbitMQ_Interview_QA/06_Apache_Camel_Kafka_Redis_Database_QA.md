@@ -356,3 +356,4 @@ This uses an index range scan with constant $O(\log N)$ latency whether on page 
 - **Decision** (what was chosen and why)
 - **Consequences** (trade-offs accepted, operational impact, follow-up tasks)
 ADRs prevent teams from relitigating past decisions and onboard new engineers quickly.
+

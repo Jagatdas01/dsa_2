@@ -13,6 +13,7 @@ Target: 6 to 10 years experience, integration architecture role.
 7. Architecture and Governance (Q39 to Q42)
 8. Frequently Asked Tricky & Deep-Dive Questions (Q43 to Q56)
 9. Transactions Deep-Dive (Q57 to Q64)
+10. Production & Scenario-Based Spring Boot & JPA Questions (Q65 to Q67)
 
 ---
 
@@ -1135,3 +1136,58 @@ interface AccountRepo extends JpaRepository<Account, Long> {
 **Answer:** Put it on the **service layer**, where a business use case is defined. Controllers should not own transactions (long transactions, mixing HTTP concerns). Spring Data repository methods are already transactional per call (`readOnly` for reads), but a use case calling several repositories needs one service-level transaction so all writes commit or roll back together.
 
 In tests, `@Transactional` on a `@SpringBootTest`/`@DataJpaTest` method **rolls back automatically** after each test, keeping the DB clean. Use `@Commit` / `@Rollback(false)` to keep the data. Note: code running on other threads (e.g. RabbitMQ listeners) will not see the uncommitted test data.
+
+---
+
+## 10. Production & Scenario-Based Spring Boot & JPA Questions
+
+### Q65. Your `@Async` method throws an exception and nobody catches it. What happens?
+
+**Answer:** It depends on the return type of the `@Async` method:
+- **If the return type is `CompletableFuture<T>` / `Future<T>`:** The exception is captured inside the `Future`. **Nothing happens** on the caller thread until someone calls `.get()` or `.join()` (or attaches `.exceptionally(...)`). If nobody checks the `Future`, the exception is **silently swallowed**.
+- **If the return type is `void`:** The caller has no `Future` handle. Spring catches the exception on the background thread and delegates it to `AsyncUncaughtExceptionHandler` (the default `SimpleAsyncUncaughtExceptionHandler` only **logs** the error—it does not propagate to the caller or roll back any caller transaction).
+
+**Best practices:**
+- Return `CompletableFuture<T>` and handle errors with `.exceptionally()` / `.handle()`.
+- For `void` `@Async` methods, register a custom `AsyncUncaughtExceptionHandler` via `AsyncConfigurer` to log structured alerts, increment failure metrics, or push to a retry/DLQ mechanism.
+
+```java
+@Configuration
+@EnableAsync
+class AsyncConfig implements AsyncConfigurer {
+    @Override
+    public AsyncUncaughtExceptionHandler getAsyncUncaughtExceptionHandler() {
+        return (ex, method, params) ->
+            log.error("Async failure in {} with params {}", method.getName(), params, ex);
+    }
+}
+```
+
+### Q66. Spring Boot startup is taking 45 seconds. How do you diagnose and fix it?
+
+**Answer:**
+**How to diagnose:**
+1. **Enable Startup Actuator / `BufferingApplicationStartup`:** Exposes `/actuator/startup` with exact timing for every bean creation, auto-configuration, and component scan step.
+2. **Spring Boot Startup Report / Flight Recorder:** Run with `--debug` or `ApplicationStartup` / JFR to spot slow `@PostConstruct`, DB/Flyway migrations, or remote calls during startup.
+
+**Common causes & fixes:**
+- **Broad `@ComponentScan`:** Scanning huge base packages (e.g., `com.company`) instead of `com.company.orderservice`.
+- **Unused auto-configurations / classpath bloat:** Exclude unused starters or disable JMX (`spring.jmx.enabled=false`).
+- **Eager DB/HTTP/Kafka connections at startup:** External calls inside `@PostConstruct` or `CommandLineRunner`, or Hibernate `ddl-auto` / schema validation on large schemas.
+- **Lazy initialization (where appropriate):** `spring.main.lazy-initialization=true` (useful in dev/serverless, though in prod you usually want fail-fast on bad config).
+- **AOT / CDS / GraalVM Native Image:** Use Spring Boot 3.x **AppCDS** (`-XX:ArchiveClassesAtExit`) or **AOT** processing to cut startup time by 30–50%+ without losing JVM benefits.
+
+### Q67. Your JPA query works fine with 100 rows, but takes 45 seconds with 1 million rows. What is wrong?
+
+**Answer:** Several classic JPA/DB scaling traps stay invisible at 100 rows and explode at 1M rows:
+1. **Missing database index:** Query filters (`WHERE status = ? AND created_at > ?`) or joins trigger a **full table scan** on 1M rows.
+2. **N+1 select problem:** Fetching 1,000+ parent rows and accessing a `LAZY` child triggers 1,000+ extra queries (fine for 10 parents, catastrophic at scale).
+3. **Fetching everything into memory (`findAll()` / large `List`):** Loading 1M rows creates millions of managed Hibernate entities in the 1st-level cache (dirty-checking overhead + GC thrashing).
+4. **Deep `OFFSET` pagination (`Pageable` with `page=50000`):** `OFFSET 1000000 LIMIT 20` forces the DB to scan and discard 1,000,000 rows.
+5. **Non-sargable predicates / functions on indexed columns:** e.g., `WHERE LOWER(email) = ?` or `DATE(created_at) = ?` bypasses B-tree indexes.
+
+**How to fix:**
+- Run **`EXPLAIN ANALYZE`** on the generated SQL (`spring.jpa.show-sql` / p6spy) and add the right composite index.
+- Use **`JOIN FETCH` / `@EntityGraph`** for associations, and **DTO projections** (skipping Hibernate entity management) for read-only queries.
+- Use **Keyset (Seek) Pagination** (`WHERE id > :lastId ORDER BY id LIMIT 50`) instead of `OFFSET`, or `Slice<T>` / `Stream<T>` with `@QueryHints` fetch size for batch processing.
+
