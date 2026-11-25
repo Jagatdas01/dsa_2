@@ -1684,51 +1684,74 @@ int[] evens = IntStream.rangeClosed(1, 10).filter(isEven).toArray();  // [2, 4, 
 
 ### Q79. `HashMap` has 1 million entries. Performance is degrading. Why and what do you do?
 
-**Answer:** A `HashMap` with 1M entries normally still gives $O(1)$ average lookup, so degradation points to one of these root causes:
-1. **Hash collisions (poor `hashCode()`):** If keys have a weak `hashCode()` (e.g., returning a constant or colliding heavily), buckets turn into linked lists ($O(n)$) or balanced red-black trees ($O(\log n)$ if `Comparable`, still much slower than $O(1)$).
-2. **Broken `equals()` / `hashCode()` or non-`Comparable` keys:** When keys are not `Comparable`, treeified buckets still fall back to `System.identityHashCode` tie-breaking and `equals()` scans.
-3. **Repeated resizing (rehashing):** Creating `new HashMap<>()` with default capacity `16` and inserting 1M entries triggers ~17 resize/rehash cycles (`16 -> 32 -> ... -> 2,097,152`), copying arrays and recalculating bucket indices.
-4. **GC & memory pressure:** 1M `HashMap.Node` objects + boxed keys/values consume ~80–150 MB+ of heap, causing frequent GC cycles and CPU cache misses.
-5. **Concurrent access without synchronization:** Concurrent `put()` in a plain `HashMap` can corrupt state or cause infinite loops/CPU spikes.
+**Answer:** Normally `HashMap` gives $O(1)$ lookup even at 1M entries. When it slows down, it is because of **collisions, repeated resizing, GC pressure, or unsafe concurrency**:
+
+1. **Hash collisions (poor `hashCode()`):** If many keys land in the same bucket, lookup degrades from $O(1)$ to $O(n)$ (linked list) or $O(\log n)$ (red-black tree if keys implement `Comparable`).
+2. **Repeated rehashing:** Starting with default capacity `16` and inserting 1M entries forces ~17 full table resizes (`16 -> 32 -> ... -> 2,097,152`), copying the array and recomputing buckets each time.
+3. **Heap & GC pressure:** 1M `HashMap.Node` objects + boxed keys/values take ~100+ MB of heap, triggering frequent GC pauses and CPU cache misses.
+4. **Concurrent `put()` without synchronization:** Using plain `HashMap` across threads can corrupt internal links and spike CPU.
 
 **What to do:**
-- **Pre-size the map:** `new HashMap<>((int) (1_000_000 / 0.75f) + 1)` (or `HashMap.newHashMap(1_000_000)` in Java 19+) to avoid all rehashing.
-- **Fix `hashCode()` and `equals()`:** Ensure good bit distribution and make keys `Comparable` if collisions are possible.
-- **Reduce object/boxing overhead:** Use primitive-specialized maps (Eclipse Collections `IntObjectHashMap`, fastutil) or flatten data if keys/values are primitives.
-- **If multi-threaded:** Use `ConcurrentHashMap` with initial capacity sized appropriately.
-- **If 1M entries is really an unbounded cache:** Replace with a bounded cache like **Caffeine** (`maximumSize`, `expireAfterWrite`) or offload to Redis.
+- **Pre-size the map upfront** (avoids all 17 resizes):
+  ```java
+  Map<String, Order> map = HashMap.newHashMap(1_000_000); // Java 19+
+  // Or older Java: new HashMap<>((int) (1_000_000 / 0.75f) + 1);
+  ```
+- **Fix `hashCode()` and `equals()`** so keys spread evenly across buckets (and implement `Comparable` if collisions are possible).
+- **Use `ConcurrentHashMap`** if multiple threads read/write it.
+- **If it is acting as an unbounded cache:** Replace it with **Caffeine** (`maximumSize`, `expireAfterWrite`) or **Redis** so memory stays bounded.
+
+---
 
 ### Q80. Your code uses `synchronized` everywhere. Application is slow. What's wrong?
 
-**Answer:** Overusing `synchronized` causes **lock contention** and serializes execution across CPU cores:
-- **Coarse-grained locking:** Synchronizing entire methods (`public synchronized void process(...)`) or locking on `this` / `ClassName.class` forces threads that operate on independent data to wait for one another.
-- **Holding locks during slow I/O:** Keeping a `synchronized` lock while calling a DB, HTTP API, or writing to disk parks all other waiting threads in `BLOCKED` state, destroying throughput.
-- **Context-switching & cache-line bouncing:** High contention triggers OS thread blocking/unblocking and CPU cache invalidation.
-- **Virtual threads (Java 21) pinning:** Before Java 24 (JEP 491), blocking inside a `synchronized` block pins the virtual thread to its carrier OS thread, starving the carrier pool.
+**Answer:** `synchronized` allows **only one thread at a time** into the guarded block/method. Putting it everywhere turns a multi-core application into a **single-file queue**:
+
+- **Coarse-grained locks:** `public synchronized void handle(...)` locks on `this`, forcing unrelated requests to wait on each other.
+- **Holding locks during I/O:** Calling a DB or REST API inside `synchronized` leaves other threads `BLOCKED` for milliseconds/seconds while doing nothing.
+- **CPU context switching:** Threads constantly park and unpark, wasting CPU.
+- **Virtual thread pinning (Java 21–23):** Blocking inside `synchronized` pins the virtual thread to its OS carrier thread, starving the pool.
 
 **How to fix:**
-- **Narrow the lock scope:** Synchronize only the tiny in-memory critical section, never around I/O.
-- **Use concurrent data structures:** Replace `synchronized` + `HashMap`/`ArrayList` with `ConcurrentHashMap`, `CopyOnWriteArrayList`, or `BlockingQueue`.
-- **Use lock-free atomics:** `AtomicInteger`, `AtomicReference`, or `LongAdder` (for high-contention counters).
-- **Use finer-grained or read-write locks:** `ReentrantReadWriteLock` / `StampedLock` for read-heavy state, or lock striping by key/shard.
-- **Prefer immutability / thread confinement** so shared mutable state is eliminated altogether.
+1. **Shrink the lock:** Synchronize *only* the tiny in-memory update, never DB/HTTP calls.
+2. **Use concurrent collections:** Replace `synchronized` + `HashMap` with `ConcurrentHashMap`.
+3. **Use lock-free atomics:** Use `AtomicInteger` or `LongAdder` for counters.
+4. **Use read-write locks:** Use `ReentrantReadWriteLock` / `StampedLock` when reads vastly outnumber writes.
+
+```java
+// BAD: locks entire method including slow DB/API call
+public synchronized void recordHit(String key) {
+    counts.put(key, counts.getOrDefault(key, 0) + 1);
+    auditClient.send(key); // slow I/O while holding lock!
+}
+
+// GOOD: lock-free map + atomic counter, I/O outside any lock
+private final ConcurrentHashMap<String, LongAdder> counts = new ConcurrentHashMap<>();
+
+public void recordHit(String key) {
+    counts.computeIfAbsent(key, k -> new LongAdder()).increment();
+    auditClient.send(key);
+}
+```
+
+---
 
 ### Q81. Explain double-checked locking in Singleton. Why do you need `volatile`?
 
-**Answer:** Double-checked locking (DCL) avoids acquiring a `synchronized` lock on every `getInstance()` call after the singleton has been initialized:
+**Answer:** Double-checked locking (DCL) avoids the cost of acquiring a `synchronized` lock on every `getInstance()` call **after** the singleton is already created:
 
 ```java
 public final class ConfigManager {
-    private static volatile ConfigManager instance;
+    private static volatile ConfigManager instance; // volatile is REQUIRED
 
     private ConfigManager() {}
 
     public static ConfigManager getInstance() {
-        ConfigManager local = instance;          // single volatile read on fast path
-        if (local == null) {                     // 1st check (unlocked)
+        ConfigManager local = instance;             // 1st check (no lock, fast path)
+        if (local == null) {
             synchronized (ConfigManager.class) {
                 local = instance;
-                if (local == null) {             // 2nd check (locked)
+                if (local == null) {                // 2nd check (inside lock)
                     local = new ConfigManager();
                     instance = local;
                 }
@@ -1740,85 +1763,103 @@ public final class ConfigManager {
 ```
 
 **Why `volatile` is mandatory:**
-`instance = new ConfigManager()` is not atomic; the JVM/CPU can reorder instructions to:
-1. Allocate memory for `ConfigManager`.
-2. Assign the memory reference to `instance` (**before** the constructor finishes!).
+`instance = new ConfigManager()` is actually **3 steps** at the CPU/JVM level:
+1. Allocate memory.
+2. Point `instance` to that memory (**reference is now non-null!**).
 3. Run the `ConfigManager()` constructor.
 
-Without `volatile`, Thread A could assign `instance` at step 2 while Thread B sees `instance != null` at the 1st check and returns a **partially constructed object** with uninitialized fields. `volatile` establishes a **happens-before** relationship and prevents instruction reordering around the write to `instance`.
+Without `volatile`, the JVM/CPU can **reorder steps 2 and 3**. Thread A may assign `instance` at step 2 *before* the constructor finishes, while Thread B sees `instance != null` at the 1st check and returns a **half-constructed object**. `volatile` prevents this reordering and guarantees **happens-before** visibility.
 
-*(Note: In Java, the **Initialization-on-Demand Holder** idiom or a single-element `enum` is even simpler and thread-safe without DCL.)*
+*(Tip: In practice, an `enum` singleton or static inner holder class is even cleaner and thread-safe without `volatile`.)*
+
+---
 
 ### Q82. `ThreadLocal` variable in your app is causing a memory leak. How?
 
-**Answer:** Each `Thread` holds a `ThreadLocal.ThreadLocalMap` whose `Entry` extends `WeakReference<ThreadLocal<?>>`:
-- The **key** (the `ThreadLocal` reference) is a **weak** reference.
-- The **value** (your object, e.g., `UserContext`, `SimpleDateFormat`, `byte[]`) is a **strong** reference.
+**Answer:** Every `Thread` stores its `ThreadLocal` values in an internal `ThreadLocalMap` where:
+- **Key (`ThreadLocal` object)** = **WeakReference** (can be garbage-collected).
+- **Value (your data, e.g., `UserContext`, `byte[]`)** = **Strong Reference** (cannot be garbage-collected while the thread is alive).
 
-**How the leak happens:**
-1. **Thread pools reuse threads indefinitely:** Tomcat/worker threads never die. If you call `threadLocal.set(value)` and forget `threadLocal.remove()` in a `finally` block, the strong reference to `value` stays attached to that worker thread forever—even after the request finishes.
-2. **Stale entries after classloader/reference loss:** Even if the `ThreadLocal` key is garbage-collected (making the entry key `null`), the `value` remains strongly referenced inside `ThreadLocalMap` until that thread happens to call `get()`/`set()`/`remove()` and triggers stale-entry cleanup.
+**Why it leaks in real apps:**
+Web servers (Tomcat) and executors **reuse worker threads forever**—they never die. If you call `threadLocal.set(data)` and forget `threadLocal.remove()`, the strong reference to `data` stays attached to that thread permanently—even after the HTTP request ends and even if the `ThreadLocal` key itself is GC'd.
 
-**Fix:**
-- Always wrap `ThreadLocal` usage in `try { ... } finally { threadLocal.remove(); }`.
-- Never store large objects or request-scoped entities without guaranteed cleanup.
-- On Java 21+, prefer **Scoped Values (`ScopedValue`)** for structured, automatically bounded per-task context.
+**How to fix:**
+- **Always** clear it in a `finally` block:
+  ```java
+  try {
+      UserContext.set(user);
+      processRequest();
+  } finally {
+      UserContext.remove(); // prevents both memory leak AND data leaking to next request
+  }
+  ```
+- On **Java 21+**, prefer **`ScopedValue`** (automatically cleaned up when the scope exits).
+
+---
 
 ### Q83. What is the difference between `wait()` and `sleep()`? Where would each cause a deadlock?
 
-**Answer:**
+**Answer:** The key difference is **what happens to the lock**: `wait()` **releases** the lock; `sleep()` **keeps** it.
 
-| Aspect | `Object.wait()` | `Thread.sleep(ms)` |
+| Aspect | `obj.wait()` | `Thread.sleep(ms)` |
 |---|---|---|
-| **Defined on** | `java.lang.Object` | `java.lang.Thread` (static) |
-| **Lock behavior** | **Releases** the monitor lock on that object | **Keeps** all currently held locks |
-| **Requirement** | Must be called inside `synchronized(obj)` (else `IllegalMonitorStateException`) | Can be called anywhere |
-| **Wake-up** | `notify()` / `notifyAll()`, timeout, or interrupt | Timeout expires or interrupt |
-| **Purpose** | Inter-thread coordination (condition waiting) | Pausing current thread execution |
+| **Lock behavior** | **Releases** `obj`'s monitor lock | **Holds** all acquired locks |
+| **Where called** | Only inside `synchronized(obj)` | Anywhere |
+| **How it wakes up** | `notify()` / `notifyAll()`, timeout, or interrupt | Timeout expires or interrupt |
+| **Use case** | Waiting for another thread's condition/signal | Simply pausing execution |
 
 **Where each causes a deadlock:**
-- **`sleep()` deadlock:** Calling `Thread.sleep(...)` while holding a `synchronized` lock or `ReentrantLock`. Because `sleep()` **does not release the lock**, if another thread needs that lock to produce a result or release a second lock you are waiting on, both threads stall or deadlock.
-- **`wait()` deadlock (missed signal / wrong monitor / nested locks):**
-  1. **Nested locks:** Thread A holds `lock1` and calls `lock2.wait()`. `wait()` only releases `lock2`—it **still holds `lock1`**. If Thread B needs `lock1` before it can acquire `lock2` and call `lock2.notify()`, both deadlock.
-  2. **Lost wakeup:** Calling `wait()` without checking the condition in a `while` loop after `notify()` already fired leaves the thread waiting forever.
+1. **`sleep()` deadlock:** Thread A acquires `lock` and calls `Thread.sleep(10_000)` while waiting for Thread B to finish a task—but Thread B needs `lock` to finish! Since `sleep()` never releases `lock`, both threads stall/deadlock.
+2. **`wait()` deadlock:**
+   - **Nested locks:** Thread A holds `lock1` and calls `lock2.wait()`. `wait()` only releases `lock2`, **not `lock1`**. If Thread B needs `lock1` before it can acquire `lock2` and call `lock2.notify()`, both deadlock.
+   - **Missed signal:** Calling `wait()` without a `while (!condition)` check after `notify()` already ran leaves the thread waiting forever.
+
+---
 
 ### Q84. Your app ran fine for 30 days, then crashed with `OutOfMemoryError`. No code changes. What happened?
 
-**Answer:** A slow **resource/memory leak** or **unbounded data growth** finally exhausted heap, metaspace, or native memory:
-1. **Unbounded in-memory collection / cache:** A `Map`, `List`, or static cache without eviction (`HashMap` used as cache) slowly accumulated entries over 30 days.
-2. **`ThreadLocal` leak** in thread pools where `.remove()` was missed on rare error paths.
-3. **Listener / callback / connection leak:** Unclosed `InputStream`, JDBC `ResultSet`, HTTP clients, or event listeners registered repeatedly without deregistration.
-4. **Data volume growth:** A batch job or report query (`findAll()`) grew alongside 30 days of new DB rows until loading them all into memory exceeded `-Xmx`.
-5. **Metaspace / Direct memory leak:** Dynamic proxy/class generation (`ClassLoader` leak) or off-heap `ByteBuffer` allocations exceeding `-XX:MaxDirectMemorySize`.
+**Answer:** A slow **memory leak** or **unbounded data growth** finally filled up the heap (or Metaspace/direct memory) after 30 days.
+
+**Most common causes:**
+1. **Unbounded cache / collection:** A `static Map` or `List` that keeps adding entries without eviction/TTL.
+2. **`ThreadLocal` leak:** Missing `.remove()` on an exception path in thread-pool workers.
+3. **Unclosed resources:** Streams, JDBC `ResultSet`s, HTTP response bodies, or listeners not closed in `try-with-resources`.
+4. **Growing database table:** A `findAll()` or report query loaded 1,000 rows on Day 1, and 10 million rows on Day 30—blowing past `-Xmx`.
 
 **How to diagnose:**
-- Enable `-XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=/dumps/heap.hprof`.
-- Analyze the `.hprof` dump in **Eclipse MAT** or **VisualVM** -> check **Dominator Tree** and **Leak Suspects** to find which object/collection holds the retained heap.
-- Review GC logs and Micrometer/Prometheus heap-after-GC trend (a classic sawtooth climbing steadily upward confirms a leak).
+1. Run the JVM with `-XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=/dumps/heap.hprof`.
+2. Open the `.hprof` file in **Eclipse MAT** or **VisualVM** -> inspect **Dominator Tree** / **Leak Suspects** to see which class or collection is retaining the memory.
+3. Check the heap-after-GC metric over 30 days: a **steadily rising baseline** confirms a leak.
+
+---
 
 ### Q85. GC is running every 30 seconds, and the application pauses for 2 seconds each time. How do you fix it?
 
-**Answer:** A 2-second pause every 30 seconds means the heap is under heavy **allocation/promotion pressure** or **Old Gen is nearly full**, triggering frequent Stop-The-World (STW) mixed/Full GCs.
+**Answer:** A 2-second Stop-The-World pause every 30 seconds means the JVM is **allocating/promoting objects too fast** or **Old Gen is nearly full**, forcing heavy Mixed/Full GCs.
 
-**Diagnosis first:**
-- Enable GC logs (`-Xlog:gc*:file=gc.log:time,uptime,level,tags` on Java 11+) and inspect with **GCeasy** or **JDK Mission Control**.
-- Check: Is it Young GC, Mixed GC, Humongous allocations, or Full GC? What is the live set size after GC?
+**Step 1 — Diagnose first:**
+- Turn on GC logs (`-Xlog:gc*:file=gc.log:time,uptime,level,tags`) and inspect with **GCeasy** or **JDK Mission Control** to see *which* GC phase is taking 2s and how much live memory remains after GC.
 
-**How to fix:**
-1. **Fix excessive allocations / memory leaks:** Profile allocations with **JFR / async-profiler** (`-e alloc`). Eliminate unnecessary object creation in hot paths (large DTOs, `String` concatenation, unbounded queries).
-2. **Right-size the heap (`-Xms` = `-Xmx`):** If live data is 3 GB and `-Xmx` is 4 GB, Old Gen stays near 75–85% full and GC thrashes constantly. Give adequate headroom (typically live set should be <= 40–50% of `-Xmx`).
+**Step 2 — Fix the root cause:**
+1. **Cut excessive allocations:** Profile with **JFR / async-profiler** (`-e alloc`) to find hot methods creating huge temporary objects, large `String`s, or loading giant DB result sets into memory.
+2. **Give the heap breathing room (`-Xms` = `-Xmx`):** If your live data is 3.2 GB and `-Xmx` is 4 GB, Old Gen is constantly 80%+ full and GC thrashes. Keep live data at **<= 40–50% of `-Xmx`**.
 3. **Tune G1GC (if using G1):**
-   - Set realistic `-XX:MaxGCPauseMillis=200` (default is 200ms; don't set it impossibly low).
-   - Address **humongous allocations** (objects > 50% of a G1 region size) by increasing `-XX:G1HeapRegionSize` or chunking large arrays.
-4. **Switch to a low-latency collector:** If low pause times (< 10ms) are required on large heaps, switch to **Generational ZGC** (`-XX:+UseZGC -XX:+ZGenerational` on Java 21+).
+   - Check for **humongous allocations** (objects > 50% of a G1 region); increase `-XX:G1HeapRegionSize` or chunk large arrays.
+   - Set a realistic `-XX:MaxGCPauseMillis=200`.
+4. **Switch to Generational ZGC (Java 21+):** If you need sub-10ms pauses on large heaps, enable `-XX:+UseZGC -XX:+ZGenerational`.
+
+---
 
 ### Q86. When would you choose G1GC over ZGC in production?
 
-**Answer:** Both are great, but **G1GC** (the default since Java 9) is often the better choice over **ZGC** in these scenarios:
-1. **Small to medium heaps (< 4–8 GB) & resource-constrained containers:** ZGC has higher memory overhead (colored pointers, load barriers, extra metadata) and needs enough CPU/heap headroom to run concurrent relocation without allocation stalls. On a 1–2 GB microservice pod with 1–2 vCPUs, G1GC uses less memory and CPU.
-2. **Maximum throughput matters more than sub-millisecond tail latency:** G1GC generally achieves **higher raw throughput** and lower CPU overhead than ZGC when occasional 50–200ms GC pauses are acceptable (e.g., batch jobs, async workers, internal APIs).
-3. **Memory-bound / tight CPU limits in Kubernetes:** ZGC's concurrent threads compete with application threads for CPU. Under tight CPU throttling (`limits.cpu`), G1GC is more predictable.
-4. **Older LTS JVMs (Java 11 / non-generational ZGC):** Generational ZGC arrived in Java 21; on older JVMs, single-generation ZGC had noticeably higher CPU/memory cost for high-allocation workloads.
+**Answer:** **G1GC** (default since Java 9) is often the better practical choice over **ZGC** when:
 
-**Rule of thumb:** Choose **G1GC** for most standard microservices (small/medium heaps, throughput-oriented, 50–200ms pauses acceptable). Choose **Generational ZGC** for large heaps (16 GB–TB+) or strict sub-10ms p99 latency SLAs (trading/fintech, real-time bidding, low-latency APIs).
+1. **Small-to-medium heaps (< 4–8 GB):** ZGC uses extra memory (colored pointers, metadata) and concurrent GC threads. On a 1–2 GB microservice pod, G1GC leaves more memory for your app.
+2. **Tight Kubernetes CPU limits:** ZGC runs concurrently alongside your app threads. Under strict CPU throttling (`limits.cpu`), G1GC's lower CPU overhead is more predictable.
+3. **Throughput matters more than <10ms tail latency:** G1GC delivers higher overall throughput when occasional 50–200ms pauses are acceptable (e.g., batch jobs, Kafka consumers, internal APIs).
+4. **Older LTS JVMs (Java 11 / 17):** Generational ZGC only arrived in Java 21; single-generation ZGC on older JVMs has noticeably higher CPU and memory overhead.
+
+**Quick rule of thumb:**
+- **G1GC:** Default choice for most microservices (small/medium heaps, tight containers, 50–200ms pauses OK).
+- **Generational ZGC (Java 21+):** Large heaps (16 GB+) or strict **< 10ms p99 latency** requirements (fintech/trading, real-time APIs).
 
